@@ -106,3 +106,7 @@ The tests run real Composer. You need `composer` on `PATH` and network or cache 
 | old script hook still present | exit 0, patched, redundant reinstall, later runs silent |
 
 Tested on Composer 2.9.5 with PHP 8.2. The re-apply was also checked on Composer 2.0.14 and 2.2.25.
+
+## License
+
+GPL-2.0-or-later. See `LICENSE`.
