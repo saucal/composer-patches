@@ -1,11 +1,13 @@
 # saucal/composer-patches
 
-A Composer plugin. When `patches.lock.json` has changed since the patches were last applied, it re-applies the [cweagans/composer-patches](https://github.com/cweagans/composer-patches) v2 patches on `composer install` / `composer update`. It needs no shell and no `jq`, and it writes no marker to the repo root.
+A Composer plugin. When a package's locked patches differ from the ones last applied to it, it re-applies the [cweagans/composer-patches](https://github.com/cweagans/composer-patches) v2 patches on `composer install` / `composer update`. It needs no shell and no `jq`, and it writes no marker files: what was applied is recorded in `vendor/composer/installed.json`.
 
-On `post-install-cmd` and `post-update-cmd`, if `extra.patches` names any packages and `patches.lock.json`'s `_hash` differs from the hash stored at `vendor/composer/patches-reapply.hash`, it reinstalls exactly those packages in-process. cweagans then re-applies their patches, and the plugin stores the new hash.
+Whenever cweagans patches a package during an install, the plugin records a fingerprint of that package's patches (sha256 of the locked patch entries) on its `installed.json` entry, under `extra.saucal-patches-applied`. On `post-install-cmd` and `post-update-cmd` it compares each installed package's recorded fingerprint with `patches.lock.json`, and reinstalls in-process every package that differs. cweagans then applies the current patches.
 - **No patches:** it does nothing and prints nothing.
+- **A patch changed or added:** only that package is reinstalled, not every patched package.
+- **A patch removed (including the last one):** its package is reinstalled once, without the patch, and its fingerprint is cleared.
 - **When it re-applies:** it prints one line, `Patches changed: re-applying patches to <pkgs>`.
-- **If re-applying fails:** it deletes the marker and Composer exits non-zero, so CI notices and the next run retries.
+- **If re-applying fails:** the old fingerprint stays in `installed.json` and Composer exits non-zero, so CI notices and the next run retries.
 
 ## Install
 
@@ -57,17 +59,18 @@ To migrate:
 2. `composer require saucal/composer-patches`, add it to `allow-plugins`, and optionally drop the direct cweagans `require` (see Install).
 3. The `.patches_applied` line in `.gitignore` can stay or go. Nothing writes that file any more. Delete any leftover `.patches_applied` file.
 
-**If the old hook is left in place:** everything still works, just redundantly. Plugin listeners run before root scripts on the same event. So on a fresh install, cweagans patches, then this plugin re-applies, then the old hook runs `composer reinstall` once more. The final state is correct and the exit code is 0. Later installs are silent from both.
+**If the old hook is left in place:** everything still works, just redundantly. Plugin listeners run before root scripts on the same event. So on a fresh install, cweagans patches (the plugin records it and stays silent), then the old hook runs `composer reinstall` once more. The final state is correct and the exit code is 0. Later installs are silent from both.
 
 ## Behaviour details
 
-- **Marker location:** `<vendor-dir>/composer/patches-reapply.hash`. Fresh checkouts never have one, so they always apply, and there's nothing to gitignore.
-- **A fresh install reinstalls the patched packages once more:** cweagans patches during install, then the plugin reinstalls because there's no marker yet. It's a clean uninstall + install, so the patch is never applied twice to the same files.
-- **Why post-update too:** `composer update` / `composer require` only re-patch packages whose version changed. When nothing changed, the check costs one file read.
-- **Mechanism:** the plugin does what `composer reinstall` does, in-process: an `UninstallOperation` + `InstallOperation` per package through `InstallationManager::execute()`. That fires package events, so cweagans' listeners load the locked patches and apply them. It fires no script events, so the plugin doesn't re-enter itself. There's no shelling out to `composer`.
-- **Failure:** cweagans throws when a patch doesn't apply. The marker was already deleted, so Composer exits 1 and the next run retries.
+- **Where the state lives:** `vendor/composer/installed.json`, the file Composer already keeps. Composer carries unknown `extra` keys through its own rewrites of that file (checked on install, update, remove and reinstall). A build that restores `installed.json` together with the installed package dirs from a previous build (for example a deploy pipeline that commits both) reinstalls nothing when the patches haven't changed, and reverts patches removed since that build. Nothing to gitignore; the fingerprint is written only through Composer's and cweagans' APIs (`Package::setExtra()`, the local repository's own write).
+- **When it's recorded:** in `post-package-install` / `post-package-update`, after cweagans' own listener (which throws if a patch fails). So a fresh install patches each package once and records it; there is no extra reinstall.
+- **Upgrading from v1.0.0:** no package has a fingerprint yet, so the first install or update after the upgrade reinstalls every patched package once. A patch removed in that same change is not reverted (nothing recorded which packages were patched). Run `composer install` once after upgrading, before removing patches. The old `vendor/composer/patches-reapply.hash` is no longer read and can be deleted.
+- **Why post-update too:** `composer update` / `composer require` only re-patch packages whose version changed. When nothing changed, the check is one pass over the installed packages.
+- **Mechanism:** the plugin does what `composer reinstall` does, in-process: an `UninstallOperation` + `InstallOperation` per package through `InstallationManager::execute()`. That fires package events, so cweagans' listeners load the locked patches and apply them, and the plugin records the new fingerprint. It fires no script events, so the plugin doesn't re-enter itself. There's no shelling out to `composer`.
+- **Failure:** cweagans throws when a patch doesn't apply, before the new fingerprint is recorded. Composer exits 1 and the next run retries.
 - **`--no-scripts`:** on Composer 2.9.5 the plugin still runs, because `--no-scripts` only disables root `scripts` listeners, not plugin listeners or package events. Older 2.x releases haven't been checked.
-- **Lock path:** taken from cweagans' `Patches::getPatchesLockFilePath()`, so `COMPOSER=other.json` (giving `other-patches.lock.json`) agrees with cweagans.
+- **Lock path:** patches are read through cweagans (`Patches::loadLockedPatches()`), so `COMPOSER=other.json` (giving `other-patches.lock.json`) agrees with cweagans. Like cweagans before an install, this creates `patches.lock.json` when it's missing.
 
 ## Limitations
 
@@ -77,8 +80,9 @@ The plugin is meant for patching ordinary packages such as WordPress plugins and
 - **Path repos with `symlink: true`:** cweagans patches the source through the symlink, so the re-apply fails on every run. Use `symlink: false`.
 - **`--download-only`:** still reinstalls the patched packages.
 - **PHP:** the plugin code is PHP 7.4-compatible, but cweagans v2 requires **PHP >= 8.0**.
-- **Patch sources:** only `extra.patches` is read. cweagans' `patches-file` and dependency-provided patches aren't covered.
+- **Patch sources:** fingerprints come from cweagans' locked patch collection, so `patches-file` and dependency-provided patches should count too; only `extra.patches` is tested.
 - **Autoloader:** not re-dumped after the reinstall, since the package version and files are unchanged.
+- **Version bumps:** a package moved to a new version gets a fresh `installed.json` entry; the plugin records it as cweagans patches it, so no extra reinstall.
 - **`--no-plugins`:** disables this plugin, as it disables cweagans.
 
 ## Tests
@@ -90,22 +94,30 @@ php tests/run.php
 The tests run real Composer. You need `composer` on `PATH` and network or cache access to Packagist. Each scenario builds a throwaway project in the system temp dir with these parts:
 - `acme/demo`: a path repo with `symlink: false`, whose `file.txt` reads `hello`;
 - a patch in `./patches`, listed in `extra.patches`;
+- for the removal scenarios, a second package `acme/other` with its own patch;
 - `patches.lock.json`, written by `composer patches-relock`;
-- this plugin, installed from a path repo that points at this checkout.
+- this plugin, installed from a path repo that points at this checkout (v1.0.0 is extracted with `git archive` for the upgrade and parity scenarios).
 
 | Scenario | Asserts |
 |---|---|
 | baseline: cweagans alone, fresh install | patched without the plugin |
 | baseline: cweagans alone, relock + install with `vendor/` | **not** re-patched (the gap) |
-| fresh install | patched, one re-apply line, marker = lock `_hash`, nothing in repo root |
-| second install | silent, still patched |
-| relock + install | new patch applied, notice names the package |
+| fresh install | patched once by cweagans, no reinstall, fingerprint in `installed.json`, no marker files |
+| second install | silent, still patched, fingerprint unchanged |
+| relock + install | new patch applied, notice names the package, new fingerprint |
 | relock + `update --lock` | new patch applied |
-| failing patch | exit 1, marker removed; fixed patch + install then re-applies |
-| no patches | exit 0, no output, no marker |
-| old script hook still present | exit 0, patched, redundant reinstall, later runs silent |
+| failing patch | exit 1, old fingerprint kept, next run fails again; fixed patch + install then re-applies |
+| no patches | exit 0, no output, no fingerprint |
+| one of two patches removed | removed one reverted, other untouched (notice names only the removed one), fingerprint cleared, next run silent |
+| patch removed + another patch failing | exit 1; after fixing, the retry applies the fix and reverts the removed one |
+| last patch removed | reverted, fingerprint cleared, next run silent |
+| version bump | `update` to 1.0.1 patches once, records the fingerprint, no reinstall |
+| restored build | `vendor/` dropped except `installed.json` + package dirs: unchanged patches repatch nothing; a removed patch reverts only its package |
+| upgrade from v1.0.0 | patched packages reinstalled once and fingerprinted, next run silent, later removal reverts |
+| parity: jq hook vs v1.0.0 vs current | the same lifecycle (fresh, silent, changed via install/update, failing, retried, one removed, last removed) runs three times; every step jq gets right is right in both plugin versions, and the jq/v1.0.0 wrong steps are pinned |
+| old script hook still present | exit 0, patched, plugin silent, old hook's redundant reinstall, later runs silent |
 
-Tested on Composer 2.9.5 with PHP 8.2. The re-apply was also checked on Composer 2.0.14 and 2.2.25.
+Tested on Composer 2.9.5 with PHP 8.2. v1.0.0's re-apply was also checked on Composer 2.0.14 and 2.2.25; this version hasn't been run there.
 
 ## License
 
